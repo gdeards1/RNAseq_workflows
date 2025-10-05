@@ -1,0 +1,383 @@
+# ============================================
+# Script: 03_featurecounts_DESeq2.R
+# Purpose: Quantify genes (featureCounts) and run DESeq2 + shrunken MA plots
+# Inputs:  *_aligned.bam    (from 02_alignment.R)
+# Outputs: counts matrix, DE results, PCA/heatmap/MA PNGs with symbols
+# Author: Gabriel
+# Date: YYYY-MM-DD
+# ============================================
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install("apeglm")
+
+
+suppressPackageStartupMessages({
+  library(Rsubread)
+  library(DESeq2)
+  library(ggplot2)
+  library(ggrepel)
+  library(pheatmap)
+  library(dplyr)
+  library(matrixStats)
+})
+
+# --------- Paths / Parameters ---------
+base_dir   <- "D:/BST2/30-1016475569"
+bam_dir    <- file.path(base_dir, "00_fastq/trimmed/aligned_bam")
+gtf_file   <- "C:/Users/Gabriel/Documents/30-1205430437/00_fastq/genome_mouse/Mus_musculus.GRCm39.110.gtf"
+
+res_dir        <- file.path(base_dir, "02_results")
+fc_dir         <- file.path(res_dir, "featureCounts")
+deseq_dir      <- file.path(res_dir, "DESeq2")
+plot_dir       <- file.path(deseq_dir, "plots")
+
+dir.create(res_dir,  showWarnings = FALSE, recursive = TRUE)
+dir.create(fc_dir,   showWarnings = FALSE, recursive = TRUE)
+dir.create(deseq_dir,showWarnings = FALSE, recursive = TRUE)
+dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
+
+threads         <- 8
+strand_specific <- 0   # 0 = unstranded, 1 = forward, 2 = reverse (common for dUTP)
+alpha_thresh    <- 0.05
+
+# --------- Collect BAMs ----------
+bam_files <- list.files(bam_dir, pattern = "\\.bam$", full.names = TRUE)
+stopifnot(length(bam_files) > 0)
+bam_names <- sub("_aligned\\.bam$", "", basename(bam_files))
+
+# --------- featureCounts ----------
+fc <- featureCounts(
+  files = bam_files,
+  annot.ext = gtf_file,
+  isGTFAnnotationFile = TRUE,
+  GTF.featureType = "exon",
+  GTF.attrType = "gene_id",
+  useMetaFeatures = TRUE,
+  isPairedEnd = TRUE,
+  nthreads = threads,
+  strandSpecific = strand_specific
+)
+
+# Save counts and assignment stats
+counts_mat <- fc$counts
+colnames(counts_mat) <- bam_names
+write.csv(counts_mat, file = file.path(fc_dir, "gene_counts_matrix.csv"))
+write.csv(fc$stat,     file = file.path(fc_dir, "featurecounts_summary.csv"))
+saveRDS(fc,            file = file.path(fc_dir, "featurecounts_object.rds"))
+
+# --------- Build sample table ----------
+# Derive condition from sample names like: WT-1, KO-1, OE-1, WT-NE-1, KO-NE-1, OE-NE-1
+condition <- sub("^([A-Za-z0-9]+-NE)-\\d+$", "\\1", bam_names)  # WT-NE, KO-NE, OE-NE
+condition <- ifelse(grepl("-NE", condition),
+                    condition,
+                    sub("^([A-Za-z0-9]+)-\\d+$", "\\1", bam_names))  # WT, KO, OE
+sample_table <- data.frame(sample = bam_names, condition = condition,
+                           row.names = bam_names, check.names = FALSE)
+
+# --------- DESeq2 ----------
+dds <- DESeqDataSetFromMatrix(countData = counts_mat,
+                              colData   = sample_table,
+                              design    = ~ condition)
+
+# Prefilter
+keep <- rowSums(counts(dds)) >= 10
+dds  <- dds[keep, ]
+
+# Ensure reference level is WT (so coef names are *_vs_WT)
+dds$condition <- droplevels(dds$condition)
+dds$condition <- relevel(dds$condition, "WT")
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# Variance-stabilizing transform for plots
+vsd <- vst(dds, blind = FALSE)
+
+# Save core objects
+saveRDS(dds, file = file.path(deseq_dir, "dds.rds"))
+saveRDS(vsd, file = file.path(deseq_dir, "vsd.rds"))
+
+# --------- Offline GTF annotation: Ensembl gene_id -> symbol + biotype ----------
+gtf_to_ann <- function(gtf_path) {
+  # handle .gtf or .gtf.gz
+  con <- if (grepl("\\.gz$", gtf_path, ignore.case = TRUE)) gzfile(gtf_path) else gtf_path
+  
+  gt <- read.delim(con, header = FALSE, comment.char = "#",
+                   sep = "\t", quote = "", stringsAsFactors = FALSE)
+  if (ncol(gt) < 9) stop("GTF appears malformed: < 9 columns")
+  names(gt)[1:9] <- c("chr","src","type","start","end","score","strand","phase","attr")
+  
+  # keep only gene rows; keep data.frame structure
+  gene_attr <- gt[gt$type == "gene", "attr", drop = FALSE][, "attr"]
+  
+  get_attr <- function(s, key) {
+    m <- regexec(paste0(key, ' "([^"]+)"'), s)
+    v <- regmatches(s, m)
+    sapply(v, function(x) if (length(x) >= 2) x[2] else NA_character_)
+  }
+  
+  gene_id    <- get_attr(gene_attr, "gene_id")
+  gene_name  <- get_attr(gene_attr, "gene_name")
+  gene_biotype <- get_attr(gene_attr, "gene_biotype")
+  if (all(is.na(gene_biotype))) gene_biotype <- get_attr(gene_attr, "gene_type")
+  
+  ann <- data.frame(
+    ensembl_gene_id = gene_id,
+    symbol          = gene_name,
+    biotype         = gene_biotype,
+    stringsAsFactors = FALSE
+  )
+  ann <- ann[!is.na(ann$ensembl_gene_id) & !duplicated(ann$ensembl_gene_id), , drop = FALSE]
+  rownames(ann) <- ann$ensembl_gene_id
+  ann
+}
+
+# build/load once, then reuse
+ann_file_rds <- file.path(deseq_dir, "gene_annotation_from_gtf.rds")
+ann_file_csv <- file.path(deseq_dir, "gene_annotation_from_gtf.csv")
+if (!file.exists(ann_file_rds)) {
+  gene_ann <- gtf_to_ann(gtf_file)
+  saveRDS(gene_ann, ann_file_rds)
+  write.csv(gene_ann, ann_file_csv, row.names = FALSE)
+} else {
+  gene_ann <- readRDS(ann_file_rds)
+}
+
+# convenience symbol map you can reuse
+symbol_map <- setNames(gene_ann$symbol, gene_ann$ensembl_gene_id)
+
+# --------- PCA plot ----------
+png(file.path(plot_dir, "PCA_condition.png"), width = 1200, height = 1000, res = 150)
+print(plotPCA(vsd, intgroup = "condition") + ggtitle("PCA by condition"))
+dev.off()
+
+# --------- Heatmap of top 50 variable genes (symbol-labeled) ----------
+rv <- matrixStats::rowVars(assay(vsd))
+top50 <- order(rv, decreasing = TRUE)[seq_len(min(50, length(rv)))]
+mat <- assay(vsd)[top50, ]
+mat <- t(scale(t(mat)))
+ann_cols <- as.data.frame(colData(vsd)[, "condition", drop = FALSE])
+
+# label rows with gene symbols when available
+rnames <- rownames(mat)
+sym_map <- setNames(gene_ann$symbol, gene_ann$gene_id)
+display_names <- ifelse(!is.na(sym_map[rnames]) & sym_map[rnames] != "", sym_map[rnames], rnames)
+rownames(mat) <- display_names
+
+png(file.path(plot_dir, "heatmap_top50_var_genes_symbols.png"), width = 1200, height = 1400, res = 150)
+pheatmap(mat, annotation_col = ann_cols, show_rownames = TRUE)
+dev.off()
+
+# --------- LFC shrinkage helpers (apeglm preferred, fallback to ashr/normal) ----------
+shrink_pair <- function(dds, factor_name, levelA, levelB, alpha = 0.05,
+                        prefer = c("apeglm","ashr")) {
+  prefer <- match.arg(prefer)
+  rn <- resultsNames(dds)
+  A <- gsub("[^[:alnum:]]",".", levelA)
+  B <- gsub("[^[:alnum:]]",".", levelB)
+  coef_nm <- paste0(factor_name, "_", A, "_vs_", B)
+  
+  if (prefer == "apeglm" && any(rn == coef_nm)) {
+    if (!requireNamespace("apeglm", quietly = TRUE)) {
+      message("Package 'apeglm' not installed; falling back to 'ashr/normal'.")
+    } else {
+      res_raw <- results(dds, name = coef_nm, alpha = alpha)
+      out <- lfcShrink(dds, coef = coef_nm, res = res_raw, type = "apeglm")
+      return(as.data.frame(out))
+    }
+  }
+  # fall back to contrast with ashr or normal
+  if (requireNamespace("ashr", quietly = TRUE)) {
+    out <- lfcShrink(dds, contrast = c(factor_name, levelA, levelB), type = "ashr")
+  } else {
+    message("Neither 'apeglm' nor 'ashr' available; using type='normal'.")
+    out <- lfcShrink(dds, contrast = c(factor_name, levelA, levelB), type = "normal")
+  }
+  as.data.frame(out)
+}
+
+# --------- Pretty MA plot (symbols + relevance filters + labels) ----------
+plot_MA_pretty <- function(res_df, tag,
+                           padj_cut = 0.05, lfc_cut = 1, bm_cut = 10,
+                           label_top = 25, out_png = NULL,
+                           gene_ann = NULL) {
+  
+  # join annotation
+  if (!is.null(gene_ann)) {
+    res_df <- res_df %>%
+      mutate(gene_id = rownames(res_df)) %>%
+      left_join(gene_ann, by = "gene_id")
+  } else {
+    res_df$symbol <- rownames(res_df)
+    res_df$biotype <- NA_character_
+  }
+  
+  # default symbols if missing
+  res_df$symbol <- ifelse(is.na(res_df$symbol) | res_df$symbol == "", res_df$gene_id, res_df$symbol)
+  
+  # relevance filters (protein_coding by default)
+  relevant_biotypes <- c("protein_coding")  # add "lncRNA" if desired
+  drop_name_regex   <- "^(Gm\\d+)|(^.*Rik$)|(^Rps)|(^Rpl)|(^mt-)|(^Mt-)|(^Mir\\d+)|(^Rn45s)|(^RP\\w)"
+  
+  res_df <- res_df %>%
+    mutate(keep_biotype = ifelse(is.na(biotype), TRUE, biotype %in% relevant_biotypes),
+           drop_name    = grepl(drop_name_regex, symbol, ignore.case = TRUE),
+           keep_name    = !drop_name,
+           sig          = !is.na(padj) & padj < padj_cut &
+             !is.na(log2FoldChange) & abs(log2FoldChange) >= lfc_cut &
+             !is.na(baseMean) & baseMean >= bm_cut,
+           relevant     = sig & keep_biotype & keep_name)
+  
+  lab_df <- res_df %>% filter(relevant) %>% arrange(padj) %>% slice_head(n = label_top)
+  
+  p <- ggplot(res_df, aes(x = baseMean, y = log2FoldChange)) +
+    geom_hline(yintercept = 0, size = 0.4) +
+    geom_hline(yintercept = c(-lfc_cut, lfc_cut), linetype = "dashed", linewidth = 0.3) +
+    geom_point(data = subset(res_df, !relevant), alpha = 0.35, size = 0.8, color = "grey60") +
+    geom_point(data = subset(res_df,  relevant), alpha = 0.9,  size = 1.2) +
+    scale_x_log10() +
+    labs(title = paste0("MA plot (shrunken): ", tag),
+         x = "mean of normalized counts (baseMean, log10)",
+         y = "log2 fold change") +
+    theme_classic(base_size = 12)
+  
+  if (nrow(lab_df) > 0) {
+    p <- p + ggrepel::geom_text_repel(data = lab_df,
+                                      aes(label = symbol),
+                                      max.overlaps = 200, size = 3)
+  }
+  
+  if (!is.null(out_png)) {
+    png(out_png, width = 1200, height = 900, res = 150); print(p); dev.off()
+  } else {
+    print(p)
+  }
+}
+
+# --------- Run contrasts, shrink, annotate, export, and plot ----------
+# List of biologically meaningful comparisons (numerator vs denominator)
+contrast_list <- list(
+  "KO_vs_WT"      = c("KO",    "WT"),
+  "OE_vs_WT"      = c("OE",    "WT"),
+  "KO-NE_vs_WT-NE"= c("KO-NE", "WT-NE"),
+  "OE-NE_vs_WT-NE"= c("OE-NE", "WT-NE")
+)
+
+
+########
+library(dplyr)
+
+# After building/reading gene_ann from the GTF:
+# It currently has: ensembl_gene_id, symbol, biotype
+gene_ann <- gene_ann %>%
+  rename(gene_id = ensembl_gene_id)
+
+# Now your loop works unchanged
+for (tag in names(contrast_list)) {
+  grp <- contrast_list[[tag]]
+  message("Processing: ", tag)
+
+  res_df <- shrink_pair(dds, "condition", grp[1], grp[2],
+                        alpha = alpha_thresh, prefer = "apeglm")
+  res_df$gene_id <- rownames(res_df)
+
+  out_annot <- res_df %>%
+    left_join(gene_ann, by = "gene_id") %>%
+    mutate(symbol = ifelse(is.na(symbol) | symbol == "", gene_id, symbol)) %>%
+    relocate(gene_id, symbol, biotype)
+
+  write.csv(out_annot,
+            file.path(deseq_dir, paste0("DE_", tag, "_shrunken_annot.csv")),
+            row.names = FALSE)
+
+  write.csv(out_annot %>% filter(biotype %in% "protein_coding"),
+            file.path(deseq_dir, paste0("DE_", tag, "_shrunken_PROTEIN_CODING.csv")),
+            row.names = FALSE)
+
+  plot_MA_pretty(out_annot, tag,
+                 padj_cut = 0.05, lfc_cut = 1, bm_cut = 10,
+                 label_top = 25, gene_ann = gene_ann,
+                 out_png = file.path(plot_dir, paste0("MA_pretty_", tag, ".png")))
+}
+
+
+
+
+
+
+
+
+for (tag in names(contrast_list)) {
+  grp <- contrast_list[[tag]]
+  message("Processing: ", tag)
+  
+  # shrunken results (apeglm if possible; else ashr/normal)
+  res_df <- shrink_pair(dds, "condition", grp[1], grp[2], alpha = alpha_thresh, prefer = "apeglm")
+  res_df$gene_id <- rownames(res_df)
+  
+  # annotate and save CSVs
+  out_annot <- res_df %>%
+    left_join(gene_ann, by = "gene_id") %>%
+    mutate(symbol = ifelse(is.na(symbol) | symbol == "", gene_id, symbol)) %>%
+    relocate(gene_id, symbol, biotype)
+  write.csv(out_annot, file.path(deseq_dir, paste0("DE_", tag, "_shrunken_annot.csv")), row.names = FALSE)
+  
+  # protein-coding only table
+  write.csv(out_annot %>% filter(biotype %in% c("protein_coding")),
+            file.path(deseq_dir, paste0("DE_", tag, "_shrunken_PROTEIN_CODING.csv")), row.names = FALSE)
+  
+  # pretty MA plot
+  plot_MA_pretty(out_annot, tag,
+                 padj_cut = 0.05, lfc_cut = 1, bm_cut = 10,
+                 label_top = 25, gene_ann = gene_ann,
+                 out_png = file.path(plot_dir, paste0("MA_pretty_", tag, ".png")))
+}
+
+# --------- Optional: one DE heatmap for a primary contrast (symbol-labeled) ----------
+primary_contrast_tag <- "KO_vs_WT"
+primary_df <- read.csv(file.path(deseq_dir, paste0("DE_", primary_contrast_tag, "_shrunken_annot.csv")),
+                       stringsAsFactors = FALSE)
+
+padj_cutoff <- 0.05
+lfc_cutoff  <- 1.0
+max_genes   <- 50
+sig <- primary_df %>%
+  filter(!is.na(padj), padj < padj_cutoff, !is.na(log2FoldChange), abs(log2FoldChange) > lfc_cutoff) %>%
+  arrange(padj)
+if (nrow(sig) == 0) sig <- primary_df %>% arrange(padj)
+top <- head(sig$gene_id, max_genes)
+top <- intersect(top, rownames(vsd))
+
+if (length(top) >= 2) {
+  mat <- assay(vsd)[top, ]
+  mat <- t(scale(t(mat)))
+  # rownames -> symbols if available
+  sym_map2 <- setNames(gene_ann$symbol, gene_ann$gene_id)
+  rownames(mat) <- ifelse(!is.na(sym_map2[rownames(mat)]) & sym_map2[rownames(mat)] != "",
+                          sym_map2[rownames(mat)], rownames(mat))
+  ann_cols <- as.data.frame(colData(vsd)[, "condition", drop = FALSE])
+  
+  png(file.path(plot_dir, paste0("heatmap_top", min(max_genes, length(top)),
+                                 "_DE_", primary_contrast_tag, "_symbols.png")),
+      width = 1400, height = 1600, res = 150)
+  pheatmap::pheatmap(mat,
+                     annotation_col = ann_cols,
+                     color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+                     cluster_rows = TRUE, cluster_cols = TRUE,
+                     show_rownames = TRUE, fontsize_row = 7, fontsize_col = 9,
+                     main = paste0("Top DE genes (", primary_contrast_tag, "): padj<",
+                                   padj_cutoff, ", |LFC|>", lfc_cutoff))
+  dev.off()
+} else {
+  message("Too few genes to plot a DE heatmap for ", primary_contrast_tag)
+}
+
+# --------- Session info ----------
+sink(file.path(deseq_dir, "sessionInfo.txt")); print(sessionInfo()); sink()
+
+message("Done. Outputs:")
+message(" - Counts:   ", file.path(fc_dir, "gene_counts_matrix.csv"))
+message(" - Stats:    ", file.path(fc_dir, "featurecounts_summary.csv"))
+message(" - DESeq2:   ", deseq_dir)
+message(" - Plots:    ", plot_dir)
