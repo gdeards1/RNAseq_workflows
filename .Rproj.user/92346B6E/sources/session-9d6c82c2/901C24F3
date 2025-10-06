@@ -3,7 +3,7 @@
     "path": "C:/Users/Gabriel/Documents/RProjects/RNAseq_workflows/scripts/03_featurecounts_DESeq2.R",
     "project_path": "scripts/03_featurecounts_DESeq2.R",
     "type": "r_source",
-    "hash": "2907744025",
+    "hash": "0",
     "contents": "",
     "dirty": false,
     "created": 1759699695277.0,
@@ -13,8 +13,8 @@
         "tempName": "Untitled6",
         "source_window_id": "",
         "Source": "Source",
-        "cursorPosition": "20,0",
-        "scrollLine": "15"
+        "cursorPosition": "19,0",
+        "scrollLine": "8"
     },
     "folds": "",
     "lastKnownWriteTime": 1759705479,
